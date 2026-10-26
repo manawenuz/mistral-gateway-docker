@@ -1,0 +1,23 @@
+services:
+  mistral-gateway:
+    build: .
+    container_name: mistral-gateway
+    # NO ports published. Clients reach the gateway over a docker network or
+    # loopback only — never expose it to the internet (see README).
+    environment:
+      BIND: "0.0.0.0"   # inside the container only; compose publishes nothing
+      PORT: "8788"
+    env_file:
+      - ./gateway.env      # you create this (see README step 3); never commit it
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/v1/models', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# To let another compose stack (or a docker container) call the gateway,
+# attach it to this network:
+#   docker network connect mistral-gateway_default <container>
+# Or use an external network shared between both compose files.

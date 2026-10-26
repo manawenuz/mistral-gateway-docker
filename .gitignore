@@ -1,0 +1,7 @@
+gateway.env
+*.env
+!gateway.env.example
+usage.db
+pool_state.json
+__pycache__/
+*.pyc
