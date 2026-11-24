@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Local OpenAI-compatible gateway for a Mistral Vibe subscription.
 
-Bridges OpenAI-style /v1/chat/completions clients to Mistral using your
-Vibe plan key (from `vibe --setup` or copied into VIBE_KEY from
+Bridges OpenAI-style /v1/chat/completions and /v1/responses clients to
+Mistral's endpoint of the same name using your Vibe plan key (from
+`vibe --setup` or copied into VIBE_KEY from
 https://chat.mistral.ai/code/extensions), with an optional Mistral AI
 Studio API key as pay-as-you-go fallback.
 
@@ -36,17 +37,38 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+VERSION = "1.0.7"
+
 LOG = logging.getLogger("mistral-gateway")
 
 MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_RESPONSES_URL = "https://api.mistral.ai/v1/responses"
 MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models"
 MISTRAL_WHOAMI_URL = "https://console.mistral.ai/api/vibe/whoami"
+MISTRAL_SUBSCRIPTION_URL = "https://api.mistral.ai/v1/billing/subscription"
+MISTRAL_BUDGET_URL = "https://api.mistral.ai/v1/billing/budget"
 
 BASE_DIR = pathlib.Path(__file__).parent
 STATE_FILE = BASE_DIR / "pool_state.json"
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
+RESPONSES_ROUTES = ("/v1/responses", "/v1/responses/", "/responses")
 POLL_SLEEP = 0.3
 REASONING_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+# Gateway-only names -> the model Mistral serves them as.
+MODEL_ALIASES = {
+    "mistral-large": "mistral-large-4",
+    "mistral-large-latest": "mistral-large-4",
+    "deepseek-v4.1-flash": "deepseek-v4-1-flash-1017",
+    "deepseek-v4.1-flash-1017": "deepseek-v4-1-flash-1017",
+    "deepseek-v4-1-flash": "deepseek-v4-1-flash-1017",
+    "deepseek-v4-flash-1017": "deepseek-v4-1-flash-1017",
+    "zai-glm-5.3": "zai-glm-5-3",
+    "zai-glm-5.3-flash": "zai-glm-5-3-flash",
+    "glm-5.3": "zai-glm-5-3",
+    "glm-5.3-flash": "zai-glm-5-3-flash",
+    "zai-glm-5.2": "zai-glm-5-2",
+    "glm-5.2": "zai-glm-5-2",
+}
 # Rejection code -> cooldown seconds for the account that was rejected.
 # Built in main() after env files load, so gateway.env overrides apply.
 COOLDOWNS: dict[int, float] = {}
@@ -185,10 +207,10 @@ def usage_db() -> sqlite3.Connection:
 def record_usage(model: str, account: str, usage: dict) -> None:
     """Upsert one request's usage into today's row; errors never kill a reply."""
     day = time.strftime("%Y-%m-%d")
-    prompt = int(usage.get("prompt_tokens") or 0)
-    details = usage.get("prompt_tokens_details") or {}
+    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
-    completion = int(usage.get("completion_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     with USAGE_DB_LOCK:
         try:
             with usage_db() as connection:
@@ -219,6 +241,15 @@ def upstream_request(url: str, key: str, body: bytes | None, method: str = "POST
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     return urllib.request.urlopen(request, timeout=600)
+
+
+def read_quota(key: str) -> dict:
+    """The plan and the monthly allowances the key's organization has used."""
+    with upstream_request(MISTRAL_SUBSCRIPTION_URL, key, None, method="GET") as response:
+        subscription = json.loads(response.read())
+    with upstream_request(MISTRAL_BUDGET_URL, key, None, method="GET") as response:
+        budget = json.loads(response.read())
+    return {"subscription": subscription, "budget": budget}
 
 
 def upstream_request_with_retry(
@@ -314,9 +345,30 @@ def normalize_stream_event(event: bytes, saw_tool_call: bool = False) -> tuple[b
     return b"data: " + json.dumps(parsed).encode() + separator + tail, saw_tool_call
 
 
+def keep_chat_models(models: dict) -> dict:
+    """Leave out the models that cannot chat, such as embedding, OCR and speech models."""
+    models["data"] = [
+        model
+        for model in models.get("data", [])
+        if model.get("capabilities", {}).get("completion_chat", True)
+    ]
+    return models
+
+
+def add_alias_models(models: dict) -> dict:
+    """List each gateway alias as a model of its own, replacing any upstream entry of that name."""
+    upstream_models = {model["id"]: model for model in models.get("data", [])}
+    listed = [model for model in models.get("data", []) if model["id"] not in MODEL_ALIASES]
+    for alias, model_id in MODEL_ALIASES.items():
+        if model_id in upstream_models:
+            listed.append({**upstream_models[model_id], "id": alias})
+    models["data"] = listed
+    return models
+
+
 def parse_event(event: bytes) -> dict | None:
     try:
-        parsed = json.loads(event[6:].strip())
+        parsed = json.loads(event.partition(b"data:")[2])  # Responses events start with an event: line
     except ValueError:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -359,10 +411,13 @@ def snap_reasoning_effort(body: bytes, detail: bytes) -> bytes | None:
     if "reasoning_effort" not in error_text:
         return None
     chat_request = json.loads(body)
-    requested = chat_request.get("reasoning_effort")
+    # Responses requests nest the level as reasoning.effort.
+    reasoning = chat_request.get("reasoning")
+    effort_owner, effort_key = (reasoning, "effort") if isinstance(reasoning, dict) else (chat_request, "reasoning_effort")
+    requested = effort_owner.get(effort_key)
     if "reasoning_effort is not enabled" in error_text and requested is not None:
         LOG.info("reasoning_effort %s unsupported, retrying without it", requested)
-        del chat_request["reasoning_effort"]
+        del effort_owner[effort_key]
         return json.dumps(chat_request).encode()
     if "is not supported" not in error_text:
         return None
@@ -375,7 +430,7 @@ def snap_reasoning_effort(body: bytes, detail: bytes) -> bytes | None:
     candidates = supported if requested in ("none", "minimal", "low") else reversed(supported)
     closest = min(candidates, key=lambda level: abs(REASONING_EFFORT_LEVELS.index(level) - rank))
     LOG.info("reasoning_effort %s unsupported, retrying as %s", requested, closest)
-    chat_request["reasoning_effort"] = closest
+    effort_owner[effort_key] = closest
     return json.dumps(chat_request).encode()
 
 
@@ -420,10 +475,11 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy_body(self, body: bytes, stream: bool) -> None:
         """Try accounts in pool order; stream the winning response downstream."""
         last_error = None
+        url = MISTRAL_RESPONSES_URL if self.path in RESPONSES_ROUTES else MISTRAL_CHAT_URL
         for account in POOL.accounts_for():
             try:
                 upstream = upstream_request_with_retry(
-                    MISTRAL_CHAT_URL, account.key, account.name, body
+                    url, account.key, account.name, body
                 )
             except urllib.error.HTTPError as error:
                 try:
@@ -497,6 +553,7 @@ class Handler(BaseHTTPRequestHandler):
                         sent += len(event)
                         self.wfile.flush()
                         event_json = parse_event(event) or {}
+                        event_json = event_json.get("response") or event_json
                         stream_model = event_json.get("model") or stream_model
                         stream_usage = event_json.get("usage") or stream_usage
                 if pending and is_cut_event(pending):
@@ -508,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                     sent += len(tail_event)
                     self.wfile.flush()
                     event_json = parse_event(tail_event) or {}
+                    event_json = event_json.get("response") or event_json
                     stream_model = event_json.get("model") or stream_model
                     stream_usage = event_json.get("usage") or stream_usage
                 LOG.info("stream complete: key=%s forwarded=%dB tool_calls=%s", account.name, sent, saw_tool_call)
@@ -534,6 +592,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(200, {"ok": True})
             return self._reply(200, {
                 "ok": True,
+                "version": VERSION,
                 "accounts": len(POOL.accounts),
                 "serving": len(POOL.accounts_for()),
             })
@@ -561,7 +620,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 finally:
                     upstream.close()
-                return self._reply(200, models)
+                return self._reply(200, add_alias_models(keep_chat_models(models)))
             return self._reply(502, {"error": {"message": "all keys failed"}})
         if route == "/pool/status":
             now = time.time()
@@ -577,6 +636,16 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": accounts,
                 "serving": [account.name for account in POOL.accounts_for()],
             })
+        if route == "/quota":
+            account = POOL.accounts[0]
+            try:
+                quota = read_quota(account.key)
+            except urllib.error.HTTPError as error:
+                error.close()
+                return self._reply(502, {"error": {"message": f"Mistral billing answered HTTP {error.code}"}})
+            except (OSError, ValueError) as error:
+                return self._reply(502, {"error": {"message": f"Mistral billing: {error}"}})
+            return self._reply(200, {"key": account.name, **quota})
         if route == "/usage":
             # Optional ?days=N limits the window; default is everything logged.
             params = urllib.parse.parse_qs(query)
@@ -605,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(403, {"error": {"message": "forbidden host"}})
         if not self._authorized():
             return self._reply(401, {"error": {"message": "unauthorized"}})
-        if self.path not in ("/v1/chat/completions", "/v1/chat/completions/", "/chat/completions"):
+        if self.path not in ("/v1/chat/completions", "/v1/chat/completions/", "/chat/completions") + RESPONSES_ROUTES:
             return self._reply(404, {"error": {"message": f"unknown route {self.path}"}})
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
             return self._reply(411, {"error": {"message": "Content-Length required"}})
@@ -625,7 +694,18 @@ class Handler(BaseHTTPRequestHandler):
             chat_request = None
         if not isinstance(chat_request, dict):
             return self._reply(400, {"error": {"message": "invalid JSON body"}})
+        aliased_model = MODEL_ALIASES.get(str(chat_request.get("model")))
+        if aliased_model:
+            chat_request["model"] = aliased_model
+            body = json.dumps(chat_request).encode()
+        # Mistral stores nothing: chat answers the field with 422, responses answers true with 400.
+        if "store" in chat_request:
+            del chat_request["store"]
+            body = json.dumps(chat_request).encode()
         stream = bool(chat_request.get("stream"))
+        if self.path in RESPONSES_ROUTES:
+            self._request_model = chat_request.get("model") or "unknown"
+            return self._proxy_body(body, stream)
         changed = False
         if stream and "stream_options" not in chat_request:
             # Without include_usage the final usage chunk never arrives, and
@@ -652,6 +732,13 @@ class Handler(BaseHTTPRequestHandler):
             chat_request["max_tokens"] = 131072 if "glm" in str(chat_request.get("model")) else 32768
             changed = True
         messages = chat_request.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                # Replies carry these fields, and Mistral 422s when a client sends a reply back as it came.
+                for field in ("reasoning_content", "index"):
+                    if isinstance(message, dict) and field in message:
+                        del message[field]
+                        changed = True
         if (
             "reasoning_effort" not in chat_request
             and "glm" in str(chat_request.get("model"))
@@ -695,11 +782,17 @@ def main() -> int:
             LOG.info("vibe plan: %s (%s)", whoami.get("plan_name"), whoami.get("plan_type"))
         except (urllib.error.HTTPError, OSError, ValueError) as error:
             LOG.warning("vibe whoami failed (continuing anyway): %s", error)
+        try:
+            vibe_budget = read_quota(account.key)["budget"].get("vibe_budget") or {}
+            LOG.info("vibe allowance: %.0f%% used, resets %s",
+                     vibe_budget.get("usage_percentage", 0), vibe_budget.get("reset_at"))
+        except (urllib.error.HTTPError, OSError, ValueError, AttributeError) as error:
+            LOG.warning("vibe quota read failed (continuing anyway): %s", error)
 
     port = int(os.environ.get("PORT", "8788"))
     bind_address = os.environ.get("BIND", "127.0.0.1")
     server = ThreadingHTTPServer((bind_address, port), Handler)
-    LOG.info("mistral gateway on %s:%d (keys: %s)", bind_address, port,
+    LOG.info("mistral gateway %s on %s:%d (keys: %s)", VERSION, bind_address, port,
              ", ".join(account.name for account in POOL.accounts))
 
     def shutdown(signum, frame):
