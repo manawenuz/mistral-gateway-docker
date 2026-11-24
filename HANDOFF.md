@@ -1,6 +1,6 @@
-# BRAINDUMP — Mistral Vibe gateway: finish GHCR pipeline + deploy
+# BRAINDUMP — Mistral Vibe gateway: GHCR pipeline + deploy
 
-Handoff brief. Written 2026-11-24. For the next agent. Repo: `~/apps/mistral-gateway-docker` on this host (maneuro, user `ansible`; docker requires `sudo -n`).
+Handoff brief. Written 2026-11-24, updated 2026-11-24 (step 1–3 completed from Hermes container). For the next agent. Repo on maneuro: `~/apps/mistral-gateway-docker` (user `ansible`; docker requires `sudo -n`). GitHub: `manawenuz/mistral-gateway-docker`. Credential from the Hermes container side: fine-grained PAT replaced 2026-11-24 in `/opt/data/.config/gh_token` (scopes: repo, workflow, packages).
 
 ## ⚠️ Critical constraint (user-confirmed)
 
@@ -14,25 +14,30 @@ Skill with full operating procedures: `skill_view(name='mistral-vibe-gateway')` 
 
 ## State — DONE (verified)
 
+**Steps 1–3 of the remaining-task list completed 2026-11-24 from the Hermes container** (by the follow-on session, after the user replaced the token):
+
+1. **Workflow pushed to GitHub main.** Commit `8f345f6` "ci: build and publish Docker image to GHCR on push to main" — clean-room re-creation of `.github/workflows/docker.yml` (standard `docker/build-push-action@v6` + GHCR login + metadata tags `latest`/`main`/`sha-…`). GitHub main is now `8f345f6`, ahead of maneuro's local `main` (`6fa6249`, whose workflow commit is superseded — discard or rebase onto `8f345f6`).
+2. **Actions run green.** Run `45334635583`, completed `success` in ~2 min.
+3. **Image live and PUBLIC** at `ghcr.io/manawenuz/mistral-gateway-docker`, tags `latest`, `main`, `sha-8f345f6` (API confirms package visibility: public). No `docker login ghcr.io` needed on maneuro for pulling.
+
+#### Earlier state (pre-token, from maneuro session)
 1. **Upstream merge complete**: repo was 41 commits behind; `gateway.py` was pristine upstream v1.0.3, taken to v1.0.7 wholesale (`git merge upstream/main --allow-unrelated-histories`, conflicts resolved: gateway.py + gateway.env.example = theirs; README/.gitignore = ours; Dockerfile/compose = ours, no conflict). Commit `3d3b9cb`. `py_compile` passed.
 2. **Deployed and live**: rebuilt container 2026-11-24, `sudo -n docker compose up -d --build`. `/health` → `{"ok": true, "version": "1.0.7", "accounts": 1, "serving": 1}`. A real streaming request (tool calls, GLM reasoning-snap retry observed in logs) served during verification. `/quota` endpoint works and shows both budget pools.
-3. **Fork pushed**: `https://github.com/manawenuz/mistral-gateway-docker` (origin). Remote `main` = `3d3b9cb` (v1.0.7 code, NO workflow file). Local `main` = `6fa6249`, one commit ahead: adds `.github/workflows/docker.yml`.
-4. GH iris repo actions: already enabled (API returned 204/`enabled: true`).
+3. ~~Fork pushed~~ (superseded): remote `main` was `3d3b9cb`; old local-ahead commit `6fa6249` is now superseded by `8f345f6`.
+4. Repo actions: already enabled (API returned 204/`enabled: true`).
 
-## State — BLOCKED (this is your work)
+## State — RESOLVED / remaining work is maneuro-side only
 
-- **Pushing the workflow file fails**: the only credential is `GITHUB_TOKEN` in `~/.hermes/.env` (40-char classic PAT, has repo scope). GitHub rejects pushes containing `.github/workflows/*` without `workflow` scope: "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/docker.yml` without `workflow` scope". Never print the token; source the env file inside bash: `bash -c 'set -a; source ~/.hermes/.env; …'`.
-- **Two unblock paths** (user was offered these; do whichever is available):
-  - (a) User swaps in a new PAT with `repo,workflow` scopes. Swap one-liner for the user to run themselves: `read -s -p "Paste GitHub token: " T && sed -i '/^GITHUB_TOKEN=/d' ~/.hermes/.env && echo "GITHUB_TOKEN=$T" >> ~/.hermes/.env && unset T`
-  - (b) User pushes `6fa6249` from their laptop.
-- After push: watch the Actions run (no `gh` CLI installed on this host; use the GitHub API with the PAT: `GET /repos/manawenuz/mistral-gateway-docker/actions/runs`).
+- ~~Pushing the workflow file fails~~ **RESOLVED 2026-11-24**: the old 40-char classic PAT (`GITHUB_TOKEN` in `~/.hermes/.env` on maneuro) lacked `workflow` scope. The user issued a OAuth-style token (`gho_…`, 40 chars) with `repo, workflow, write:packages` scopes and stored it in the Hermes container at `/opt/data/.config/gh_token` (chmod 600). That token pushed commit `8f345f6` to `main` successfully. NOTE: maneuro's `~/.hermes/.env` GITHUB_TOKEN is still the OLD token — if working from maneuro, either use the Hermes-container token file or have the user rotate `~/.hermes/.env` too.
+- Remaining blocked work is only what requires maneuro access (compose switch + redeploy), which no Hermes-container session has until maneuro's SSH is reachable.
+- **Next agent on maneuro**: local `main` at `6fa6249` is now BEHIND origin/main (`8f345f6`). Run `git fetch origin && git checkout main && git reset --hard origin/main` (or rebase) to adopt the pushed workflow commit.
 
 ## Remaining tasks, in order
 
-1. Push workflow commit `6fa6249` (see unblock paths).
-2. Verify Actions run green → image at `ghcr.io/manawenuz/mistral-gateway-docker:latest` plus `:1.0.7` and `:sha-…` tags.
-3. **GHCR package visibility**: new ghcr.io packages default to private. On maneuro, either make the package public (web UI) or `sudo docker login ghcr.io` with a PAT having `read:packages`.
-4. Switch `docker-compose.yml` (or the override) from `build:` to `image: ghcr.io/manawenuz/mistral-gateway-docker:latest`. Read `docker-compose.yml` + `docker-compose.override.yml` first — env/secrets come from `gateway.env` (`VIBE_KEY`, `GATEWAY_KEY`, `BIND=0.0.0.0`, `PORT=8788`); do NOT print the file's secrets.
+1. ~~Push workflow commit~~ **DONE** (`8f345f6`, pushed from Hermes container).
+2. ~~Verify Actions run green~~ **DONE** (run `45334635583`, success; tags `latest`, `main`, `sha-8f345f6`).
+3. ~~GHCR package visibility~~ **DONE** (package already public — no login needed to pull).
+4. On maneuro: sync local repo (`git fetch origin && git checkout main && git reset --hard origin/main`), then switch `docker-compose.yml` from `build:` to `image: ghcr.io/manawenuz/mistral-gateway-docker:latest`. Read `docker-compose.yml` + `docker-compose.override.yml` first — env/secrets come from `gateway.env` (`VIBE_KEY`, `GATEWAY_KEY`, `BIND=0.0.0.0`, `PORT=8788`); do NOT print the file's secrets.
 5. Redeploy **respecting the critical constraint above** (ideally user-triggered): `sudo -n docker compose pull && sudo -n docker compose up -d`. Note: `docker compose up` gets blocked if run as a foreground terminal command — run with `terminal(background=true)` and wait via `process_manage`.
 6. Verify: `curl -H "Authorization: Bearer $(grep '^GATEWAY_KEY=' gateway.env | cut -d= -f2)" http://127.0.0.1:8788/health` shows the new version; logs show a served request.
 
