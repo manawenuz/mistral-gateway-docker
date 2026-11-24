@@ -1,9 +1,9 @@
 services:
   mistral-gateway:
-    build: .
-    container_name: mistral-gateway
-    # NO ports published. Clients reach the gateway over a docker network or
+    # Prebuilt image from GHCR (built by .github/workflows/docker.yml on push to main).
+    # No ports published. Clients reach the gateway over a docker network or
     # loopback only — never expose it to the internet (see README).
+    image: ghcr.io/manawenuz/mistral-gateway-docker:latest
     environment:
       BIND: "0.0.0.0"   # inside the container only; compose publishes nothing
       PORT: "8788"
