@@ -1,6 +1,6 @@
 services:
   mistral-gateway:
-    build: .
+    image: ghcr.io/manawenuz/mistral-gateway-docker:latest
     container_name: mistral-gateway
     # NO ports published. Clients reach the gateway over a docker network or
     # loopback only — never expose it to the internet (see README).
