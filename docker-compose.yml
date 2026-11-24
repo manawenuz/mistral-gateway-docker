@@ -4,6 +4,8 @@ services:
     # No ports published. Clients reach the gateway over a docker network or
     # loopback only — never expose it to the internet (see README).
     image: ghcr.io/manawenuz/mistral-gateway-docker:latest
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     environment:
       BIND: "0.0.0.0"   # inside the container only; compose publishes nothing
       PORT: "8788"
