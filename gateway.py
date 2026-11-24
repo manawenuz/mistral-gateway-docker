@@ -34,10 +34,39 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = "1.0.7"
+
+# --- PARITY PATCH: Vibe client constants -------------------------------------
+# Version of the Vibe CLI we present as (keep in sync with
+# github.com/mistralai/mistral-vibe when it updates).
+VIBE_CLIENT_VERSION = "3.1.4"
+# One affinity id per gateway process: the real client sends its root session
+# id (stable across a session family). A per-process stable id is the closest
+# honest analogue without leaking per-request churn.
+AFFINITY_ID = str(uuid.uuid4())
+# Platform fields the real client reports in metadata (linux, x86_64, distro
+# version). Computed once at import like the CLI does at launch.
+import platform as _platform  # noqa: E402
+
+def _linux_os_version() -> str | None:
+    try:
+        os_release = _platform.freedesktop_os_release()
+    except OSError:
+        return None
+    return os_release.get("VERSION_ID") or os_release.get("VERSION")
+
+_PLATFORM_ID = {"win32": "windows", "darwin": "darwin", "linux": "linux"}.get(
+    sys.platform, sys.platform
+)
+_ARCH = _platform.machine().lower()
+_OS_VERSION = _linux_os_version() or _platform.release()
+# gateway's own session id, mirroring the CLI's per-session uuid4.
+SESSION_ID = str(uuid.uuid4())
+# --- END PARITY PATCH ---------------------------------------------------------
 
 LOG = logging.getLogger("mistral-gateway")
 
@@ -238,7 +267,20 @@ def upstream_request(url: str, key: str, body: bytes | None, method: str = "POST
         url,
         data=body,
         method=method,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            # --- PARITY PATCH: mimic Vibe CLI v3.1.4 client signals (UA, affinity) ---
+            # Real client: vibe/utils/http.py get_user_agent("mistral") ->
+            # "mistral-client-python/Mistral-Vibe/<ver>", injected as extra_headers
+            # at vibe/app_server/_runtime.py:636 and passed through the mistralai
+            # SDK as http_headers (which override the SDK's own user-agent).
+            # x-affinity: harness sends root/session id (per session family,
+            # _runtime_config.py:581); we keep one stable id per gateway process.
+            "User-Agent": f"mistral-client-python/Mistral-Vibe/{VIBE_CLIENT_VERSION}",
+            "x-affinity": AFFINITY_ID,
+            # --- END PARITY PATCH ---
+        },
     )
     return urllib.request.urlopen(request, timeout=600)
 
@@ -724,6 +766,34 @@ class Handler(BaseHTTPRequestHandler):
         if "user" in chat_request:
             del chat_request["user"]
             changed = True
+        # --- PARITY PATCH: request metadata ---------------------------------
+        # The real Vibe client rides a metadata dict on every completion
+        # (adapters/mistral.py:167, built by app_server/_completion_attribution.py
+        # -> core/telemetry/build_metadata.py): os/arch/os_version/version/
+        # session_id/call_type/call_source/host_kind, exclude_none=True, all
+        # values stringified. call_type: first call of a turn is "main_call",
+        # follow-ups (tool iterations) are "secondary_call". We detect
+        # follow-ups the same way: the last message is a tool result.
+        if "metadata" not in chat_request:
+            messages_meta = chat_request.get("messages")
+            is_followup = bool(
+                isinstance(messages_meta, list)
+                and messages_meta
+                and isinstance(messages_meta[-1], dict)
+                and messages_meta[-1].get("role") == "tool"
+            )
+            chat_request["metadata"] = {
+                "os": _PLATFORM_ID,
+                "arch": _ARCH,
+                "os_version": _OS_VERSION,
+                "version": VIBE_CLIENT_VERSION,
+                "session_id": SESSION_ID,
+                "call_type": "secondary_call" if is_followup else "main_call",
+                "call_source": "vibe_code",
+                "host_kind": "local",
+            }
+            changed = True
+        # --- END PARITY PATCH -------------------------------------------------
         if "max_tokens" not in chat_request:
             # Mistral caps GLM completions at 4096 tokens when max_tokens is
             # absent; thinking alone eats that, so long-composition turns end
